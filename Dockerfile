@@ -8,10 +8,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L -o pdfium.tar.gz \
+RUN mkdir -p /pdfium \
+    && curl -L -o /tmp/pdfium.tgz \
     https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-x64.tgz \
-    && tar -xzf pdfium.tar.gz -C /usr/local/lib \
-    && rm pdfium.tar.gz
+    && tar -xzf /tmp/pdfium.tgz -C /pdfium \
+    && rm /tmp/pdfium.tgz
+
 
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
@@ -28,7 +30,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/lib/libpdfium.so /usr/local/lib/libpdfium.so
+COPY --from=builder /pdfium/lib/libpdfium.so /usr/local/lib/libpdfium.so
 RUN ldconfig /usr/local/lib
 
 RUN useradd -m -s /bin/bash appuser
