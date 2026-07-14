@@ -103,8 +103,8 @@ services:
   adapter:
      image: ghcr.io/blu-tiger/papra-vlm-ocr-adapter:latest
     environment:
-      VLM_URL: "http://vlm-server:8080/v1/chat/completions"
-      VLM_MODEL: "dots.ocr"
+      VLM_URL: "http://vlm-server-host:8080/v1/chat/completions"
+      VLM_MODEL: "model-name"
     restart: unless-stopped
 
 volumes:
