@@ -101,7 +101,7 @@ services:
       - adapter
 
   adapter:
-     image: ghcr.io/Blu-Tiger/papra-vlm-ocr-adapter:latest
+     image: ghcr.io/blu-tiger/papra-vlm-ocr-adapter:latest
     environment:
       VLM_BASE_URL: "http://vlm-server:8080/v1"
       VLM_MODEL: "dots.ocr"
