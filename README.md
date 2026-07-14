@@ -93,7 +93,6 @@ services:
       CONTENT_EXTRACTION_CUSTOM_HTTP_JSON_RESPONSE_TEXT_PATH: "text"
       CONTENT_EXTRACTION_CUSTOM_HTTP_REQUEST_TIMEOUT_MS: "300000"
       CONTENT_EXTRACTION_CUSTOM_HTTP_MIME_TYPES_ALLOW_LIST: "image/*,application/pdf"
-      DATABASE_URL: "file:./db/db.sqlite"
       AUTH_SECRET: "${AUTH_SECRET}"
     volumes:
       - ./app-data:/app/app-data
