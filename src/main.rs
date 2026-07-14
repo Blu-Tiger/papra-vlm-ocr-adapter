@@ -52,17 +52,17 @@ async fn extract_text_from_image(
     let b64 = general_purpose::STANDARD.encode(image_bytes);
     let data_url = format!("data:image/png;base64,{}", b64);
 
+    eprintln!("[extract] Sending to VLM: model={vlm_model}, payload={} bytes (b64)", b64.len());
+
     let body = json!({
         "model": vlm_model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": prompt },
-                    { "type": "image_url", "image_url": { "url": data_url } }
-                ]
-            }
-        ],
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": prompt },
+                { "type": "image_url", "image_url": { "url": data_url } }
+            ]
+        }],
         "max_tokens": 4096
     });
 
@@ -72,9 +72,24 @@ async fn extract_text_from_image(
         .json(&body)
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            eprintln!("[extract] VLM request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
 
-    let json: Value = resp.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let status = resp.status();
+    eprintln!("[extract] VLM responded with {status}");
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("[extract] VLM error body: {body}");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let json: Value = resp.json().await.map_err(|e| {
+        eprintln!("[extract] VLM JSON parse failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let text = json
         .pointer("/choices/0/message/content")
@@ -82,23 +97,25 @@ async fn extract_text_from_image(
         .unwrap_or("")
         .to_string();
 
+    eprintln!("[extract] VLM returned {} chars of text", text.len());
     Ok(text)
 }
 
 fn resize_if_needed(image_bytes: &[u8], max_dimension: u32) -> Result<Vec<u8>, StatusCode> {
     let img =
-        image::load_from_memory(image_bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        image::load_from_memory(image_bytes).map_err(|e| {
+            eprintln!("[resize] Failed to load image: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let (width, height) = img.dimensions();
     let longest = width.max(height);
 
     let final_img = if longest > max_dimension {
-        img.resize(
-            max_dimension,
-            max_dimension,
-            image::imageops::FilterType::Lanczos3,
-        )
+        eprintln!("[resize] {width}x{height} → resizing (max_dim={max_dimension})");
+        img.resize(max_dimension, max_dimension, image::imageops::FilterType::Lanczos3)
     } else {
+        eprintln!("[resize] {width}x{height} — no resize needed");
         img
     };
 
@@ -107,7 +124,10 @@ fn resize_if_needed(image_bytes: &[u8], max_dimension: u32) -> Result<Vec<u8>, S
     let mut buffer = Vec::new();
     final_img
         .write_to(&mut Cursor::new(&mut buffer), format)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            eprintln!("[resize] Failed to encode image: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(buffer)
 }
@@ -117,7 +137,6 @@ struct ExtractResponse {
     text: Option<String>,
     error: Option<String>,
 }
-
 async fn extract_route(
     State(config): State<(u32, String, String, String, String)>,
     mut multipart: Multipart,
@@ -128,7 +147,12 @@ async fn extract_route(
         if field.name() == Some("file") {
             let filename = field.file_name().unwrap_or("").to_string();
             let content_type = field.content_type().unwrap_or("").to_string();
-            let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            let data = field.bytes().await.map_err(|e| {
+                eprintln!("[extract] Failed to read multipart field: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+
+            eprintln!("[extract] Received: filename={filename}, type={content_type}, {} bytes", data.len());
 
             let is_pdf = content_type == "application/pdf" || filename.ends_with(".pdf");
             let is_image = content_type.starts_with("image/")
@@ -137,21 +161,32 @@ async fn extract_route(
                     .any(|ext| filename.to_lowercase().ends_with(ext));
 
             if !is_pdf && !is_image {
+                eprintln!("[extract] Unsupported file type: {content_type}");
                 return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
             }
 
             let mut image_buffers: Vec<Vec<u8>> = Vec::new();
 
             if is_pdf {
+                eprintln!("[extract] Processing PDF");
                 let pdfium = Pdfium::new(
                     Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
                         .or_else(|_| Pdfium::bind_to_system_library())
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                        .map_err(|e| {
+                            eprintln!("[extract] Failed to bind pdfium: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?,
                 );
 
                 let document = pdfium
                     .load_pdf_from_byte_vec(data.to_vec(), None)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                    .map_err(|e| {
+                        eprintln!("[extract] Failed to load PDF: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                let page_count = document.pages().len();
+                eprintln!("[extract] PDF has {page_count} page(s)");
 
                 let dpi = 200.0f32;
                 let scale = dpi / 72.0;
@@ -159,6 +194,9 @@ async fn extract_route(
                 for page in document.pages().iter() {
                     let page_width = page.width().value;
                     let page_height = page.height().value;
+                    eprintln!("[extract] Rendering page ({}x{}pt → {}x{}px)",
+                        page_width, page_height,
+                        (page_width * scale) as i32, (page_height * scale) as i32);
 
                     let render_config = PdfRenderConfig::new()
                         .set_target_width((page_width * scale) as i32)
@@ -166,22 +204,33 @@ async fn extract_route(
 
                     let bitmap = page
                         .render_with_config(&render_config)
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        .map_err(|e| {
+                            eprintln!("[extract] PDF render failed: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
 
                     let img = bitmap
                         .as_image()
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                        .map_err(|e| {
+                            eprintln!("[extract] Bitmap→image failed: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?
                         .into_rgb8();
 
                     let mut buffer = Vec::new();
                     img.write_to(&mut Cursor::new(&mut buffer), ImageFormat::Png)
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        .map_err(|e| {
+                            eprintln!("[extract] PNG encode failed: {e}");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        })?;
 
                     image_buffers.push(buffer);
                 }
             } else {
                 image_buffers.push(data.to_vec());
             }
+
+            eprintln!("[extract] {} image(s) to process", image_buffers.len());
 
             let resized_buffers: Vec<Vec<u8>> = image_buffers
                 .iter()
@@ -191,20 +240,16 @@ async fn extract_route(
             let client = reqwest::Client::new();
             let mut extracted_texts: Vec<String> = Vec::new();
 
-            for buf in &resized_buffers {
+            for (i, buf) in resized_buffers.iter().enumerate() {
+                eprintln!("[extract] Processing image {}/{}, {} bytes", i + 1, resized_buffers.len(), buf.len());
                 let text = extract_text_from_image(
-                    &client,
-                    buf,
-                    &vlm_url,
-                    &vlm_model,
-                    &vlm_api_key,
-                    &prompt,
-                )
-                .await?;
+                    &client, buf, &vlm_url, &vlm_model, &vlm_api_key, &prompt,
+                ).await?;
                 extracted_texts.push(text);
             }
 
             let combined_text = extracted_texts.join("\n\n");
+            eprintln!("[extract] Done, total extracted text: {} chars", combined_text.len());
 
             return Ok(Json(ExtractResponse {
                 text: Some(combined_text),
@@ -213,6 +258,7 @@ async fn extract_route(
         }
     }
 
+    eprintln!("[extract] No 'file' field found in multipart");
     Err(StatusCode::BAD_REQUEST)
 }
 
