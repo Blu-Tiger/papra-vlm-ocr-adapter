@@ -39,7 +39,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/papra-vlm-ocr-adapter /app/papra-vlm-ocr-adapter
 
-COPY --from=builder /usr/local/lib/libpdfium.so /app/libpdfium.so
+COPY --from=builder /pdfium/lib/libpdfium.so /app/libpdfium.so
 
 RUN chown -R appuser:appuser /app
 USER appuser
