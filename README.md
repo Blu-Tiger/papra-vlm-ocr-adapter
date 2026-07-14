@@ -96,7 +96,7 @@ services:
       DATABASE_URL: "file:./db/db.sqlite"
       AUTH_SECRET: "${AUTH_SECRET}"
     volumes:
-      - papra-data:/app/app-data
+      - ./app-data:/app/app-data
     depends_on:
       - adapter
 
