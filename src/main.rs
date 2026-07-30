@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
 
-fn load_config() -> (String, String, u32, String, String, String, String) {
+fn load_config() -> (String, String, u32, String, String, String, String, bool) {
     let max_dimension = std::env::var("MAX_DIMENSION")
         .unwrap_or_else(|_| "3360".to_string())
         .parse::<u32>()
@@ -30,6 +30,11 @@ fn load_config() -> (String, String, u32, String, String, String, String) {
 
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "".to_string());
 
+    let multi_page_parsing = std::env::var("MULTI_PAGE_PARSING")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()
+        .expect("MULTI_PAGE_PARSING must be 'true' or 'false'");
+
     (
         host,
         port,
@@ -38,6 +43,7 @@ fn load_config() -> (String, String, u32, String, String, String, String) {
         vlm_model,
         vlm_api_key,
         prompt,
+        multi_page_parsing,
     )
 }
 
@@ -62,6 +68,71 @@ async fn extract_text_from_image(
                 { "type": "text", "text": prompt },
                 { "type": "image_url", "image_url": { "url": data_url } }
             ]
+        }],
+        "max_tokens": 4096
+    });
+
+    let resp = client
+        .post(vlm_url)
+        .bearer_auth(vlm_api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("[extract] VLM request failed: {e}");
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    let status = resp.status();
+    eprintln!("[extract] VLM responded with {status}");
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("[extract] VLM error body: {body}");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let json: Value = resp.json().await.map_err(|e| {
+        eprintln!("[extract] VLM JSON parse failed: {e}");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let text = json
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    eprintln!("[extract] VLM returned {} chars of text", text.len());
+    Ok(text)
+}
+
+async fn extract_text_from_images(
+    client: &reqwest::Client,
+    image_buffers: &[Vec<u8>],
+    vlm_url: &str,
+    vlm_model: &str,
+    vlm_api_key: &str,
+    prompt: &str,
+) -> Result<String, StatusCode> {
+    let mut content: Vec<Value> = vec![json!({ "type": "text", "text": prompt })];
+
+    for image_bytes in image_buffers {
+        let b64 = general_purpose::STANDARD.encode(image_bytes);
+        let data_url = format!("data:image/png;base64,{}", b64);
+        content.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
+    }
+
+    eprintln!(
+        "[extract] Sending {} page(s) to VLM in a single request: model={vlm_model}",
+        image_buffers.len()
+    );
+
+    let body = json!({
+        "model": vlm_model,
+        "messages": [{
+            "role": "user",
+            "content": content
         }],
         "max_tokens": 4096
     });
@@ -138,10 +209,10 @@ struct ExtractResponse {
     error: Option<String>,
 }
 async fn extract_route(
-    State(config): State<(u32, String, String, String, String)>,
+    State(config): State<(u32, String, String, String, String, bool)>,
     mut multipart: Multipart,
 ) -> Result<Json<ExtractResponse>, StatusCode> {
-    let (max_dimension, vlm_url, vlm_model, vlm_api_key, prompt) = config;
+    let (max_dimension, vlm_url, vlm_model, vlm_api_key, prompt, multi_page_parsing) = config;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() == Some("file") {
@@ -238,17 +309,26 @@ async fn extract_route(
                 .collect::<Result<_, _>>()?;
 
             let client = reqwest::Client::new();
-            let mut extracted_texts: Vec<String> = Vec::new();
 
-            for (i, buf) in resized_buffers.iter().enumerate() {
-                eprintln!("[extract] Processing image {}/{}, {} bytes", i + 1, resized_buffers.len(), buf.len());
-                let text = extract_text_from_image(
-                    &client, buf, &vlm_url, &vlm_model, &vlm_api_key, &prompt,
-                ).await?;
-                extracted_texts.push(text);
-            }
+            let combined_text = if multi_page_parsing {
+                eprintln!("[extract] MULTI_PAGE_PARSING enabled — sending all pages in one request");
+                extract_text_from_images(
+                    &client, &resized_buffers, &vlm_url, &vlm_model, &vlm_api_key, &prompt,
+                ).await?
+            } else {
+                let mut extracted_texts: Vec<String> = Vec::new();
 
-            let combined_text = extracted_texts.join("\n\n");
+                for (i, buf) in resized_buffers.iter().enumerate() {
+                    eprintln!("[extract] Processing image {}/{}, {} bytes", i + 1, resized_buffers.len(), buf.len());
+                    let text = extract_text_from_image(
+                        &client, buf, &vlm_url, &vlm_model, &vlm_api_key, &prompt,
+                    ).await?;
+                    extracted_texts.push(text);
+                }
+
+                extracted_texts.join("\n\n")
+            };
+
             eprintln!("[extract] Done, total extracted text: {} chars", combined_text.len());
 
             return Ok(Json(ExtractResponse {
@@ -281,14 +361,22 @@ async fn main() {
 
     let config = load_config();
 
-    let (host, port, max_dimension, vlm_url, vlm_model, vlm_api_key, prompt) = config;
+    let (host, port, max_dimension, vlm_url, vlm_model, vlm_api_key, prompt, multi_page_parsing) =
+        config;
 
     let host_port = format!("{}:{}", host, port);
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/extract", post(extract_route))
-        .with_state((max_dimension, vlm_url, vlm_model, vlm_api_key, prompt));
+        .with_state((
+            max_dimension,
+            vlm_url,
+            vlm_model,
+            vlm_api_key,
+            prompt,
+            multi_page_parsing,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&host_port).await.unwrap();
     println!("Listening on http://{}", host_port);
