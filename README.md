@@ -106,9 +106,6 @@ services:
       VLM_URL: "http://vlm-server-host:8080/v1/chat/completions"
       VLM_MODEL: "model-name"
     restart: unless-stopped
-
-volumes:
-  papra-data:
 ```
 
 ---
