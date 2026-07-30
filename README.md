@@ -56,6 +56,7 @@ All settings via environment variables:
 | `VLM_MODEL` | Yes | — | Model name to use for text extraction |
 | `VLM_API_KEY` | No | `""` | API key for the VLM service |
 | `PROMPT` | No | `""` | Text prompt sent alongside each image |
+| `MULTI_PAGE_PARSING` | No | `false` | If `true`, all pages of a document are sent to the VLM in a single request (one prompt + all page images), instead of one request per page with results concatenated afterward. Useful for models that support long-horizon/multi-page parsing natively (e.g. context carried across pages). |
 
 > **Note:** Command-line environment variables override `.env` file values.
 
