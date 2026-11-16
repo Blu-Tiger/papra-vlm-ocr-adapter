@@ -1,5 +1,7 @@
 FROM rust:1-bookworm AS builder
 
+ARG TARGETARCH
+
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
@@ -8,11 +10,17 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /pdfium \
-    && curl -L -o /tmp/pdfium.tgz \
-    https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-x64.tgz \
+RUN case "${TARGETARCH:-amd64}" in \
+        amd64|x64) PDFIUM_ARCH=x64 ;; \
+        arm64|aarch64) PDFIUM_ARCH=arm64 ;; \
+        *) echo "Unsupported TARGETARCH: '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && mkdir -p /pdfium \
+    && curl -fL -o /tmp/pdfium.tgz \
+    "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-${PDFIUM_ARCH}.tgz" \
     && tar -xzf /tmp/pdfium.tgz -C /pdfium \
-    && rm /tmp/pdfium.tgz
+    && rm /tmp/pdfium.tgz \
+    && test -f /pdfium/lib/libpdfium.so
 
 
 COPY Cargo.toml Cargo.lock ./
@@ -31,7 +39,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /pdfium/lib/libpdfium.so /usr/local/lib/libpdfium.so
-RUN ldconfig /usr/local/lib
+RUN ldconfig
 
 RUN useradd -m -s /bin/bash appuser
 
