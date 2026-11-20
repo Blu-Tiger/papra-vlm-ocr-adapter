@@ -1,7 +1,7 @@
 use axum::extract::State;
 use axum::{
     Json, Router,
-    extract::Multipart,
+    extract::{DefaultBodyLimit, Multipart},
     http::StatusCode,
     routing::{get, post},
 };
@@ -48,7 +48,14 @@ fn load_config() -> (String, String, u32, String, String, String, String, bool) 
     )
 }
 
+/// pdfium-render stores the loaded library bindings in a process-global cell:
+/// binding succeeds only once, and every later `bind_to_*` call fails with
+/// `PdfiumLibraryBindingsAlreadyInitialized`. Bind lazily on first use and
+/// reuse that single handle for the life of the process.
 static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
+
+/// Serializes first-time initialization, so two concurrent PDF requests cannot
+/// race each other into `PdfiumLibraryBindingsAlreadyInitialized`.
 static PDFIUM_INIT: Mutex<()> = Mutex::new(());
 
 fn pdfium() -> Result<&'static Pdfium, String> {
@@ -232,19 +239,50 @@ struct ExtractResponse {
     text: Option<String>,
     error: Option<String>,
 }
+/// Flattens an error and its source chain into one line: axum's `MultipartError`
+/// displays only a generic "Error parsing `multipart/form-data` request", while
+/// the cause (body limit exceeded, truncated stream, ...) lives in its source.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 async fn extract_route(
     State(config): State<(u32, String, String, String, String, bool)>,
     mut multipart: Multipart,
 ) -> Result<Json<ExtractResponse>, StatusCode> {
     let (max_dimension, vlm_url, vlm_model, vlm_api_key, prompt, multi_page_parsing) = config;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!(
+                    "[extract] Failed to read multipart: {} (status {})",
+                    error_chain(&e),
+                    e.status()
+                );
+                return Err(e.status());
+            }
+        };
+
         if field.name() == Some("file") {
             let filename = field.file_name().unwrap_or("").to_string();
             let content_type = field.content_type().unwrap_or("").to_string();
             let data = field.bytes().await.map_err(|e| {
-                eprintln!("[extract] Failed to read multipart field: {e}");
-                StatusCode::BAD_REQUEST
+                eprintln!(
+                    "[extract] Failed to read multipart field: {} (status {})",
+                    error_chain(&e),
+                    e.status()
+                );
+                e.status()
             })?;
 
             eprintln!("[extract] Received: filename={filename}, type={content_type}, {} bytes", data.len());
@@ -389,6 +427,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/extract", post(extract_route))
+        // axum defaults to a 2 MB body limit, which rejects ordinary scanned
+        // images before they are parsed; 50 MB leaves room for large JPEGs.
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state((
             max_dimension,
             vlm_url,
