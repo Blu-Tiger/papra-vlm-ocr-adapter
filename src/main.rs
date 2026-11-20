@@ -11,6 +11,7 @@ use pdfium_render::prelude::*;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
+use std::sync::{Mutex, OnceLock};
 
 fn load_config() -> (String, String, u32, String, String, String, String, bool) {
     let max_dimension = std::env::var("MAX_DIMENSION")
@@ -45,6 +46,29 @@ fn load_config() -> (String, String, u32, String, String, String, String, bool) 
         prompt,
         multi_page_parsing,
     )
+}
+
+static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
+static PDFIUM_INIT: Mutex<()> = Mutex::new(());
+
+fn pdfium() -> Result<&'static Pdfium, String> {
+    if let Some(pdfium) = PDFIUM.get() {
+        return Ok(pdfium);
+    }
+
+    let _guard = PDFIUM_INIT.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(pdfium) = PDFIUM.get() {
+        return Ok(pdfium);
+    }
+
+    let bindings = match Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
+        Ok(bindings) => bindings,
+        Err(first) => Pdfium::bind_to_system_library()
+            .map_err(|second| format!("{}; system library: {second}", first))?,
+    };
+
+    Ok(PDFIUM.get_or_init(|| Pdfium::new(bindings)))
 }
 
 async fn extract_text_from_image(
@@ -240,14 +264,10 @@ async fn extract_route(
 
             if is_pdf {
                 eprintln!("[extract] Processing PDF");
-                let pdfium = Pdfium::new(
-                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-                        .or_else(|_| Pdfium::bind_to_system_library())
-                        .map_err(|e| {
-                            eprintln!("[extract] Failed to bind pdfium: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR
-                        })?,
-                );
+                let pdfium = pdfium().map_err(|e| {
+                    eprintln!("[extract] Failed to bind pdfium: {e}");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
                 let document = pdfium
                     .load_pdf_from_byte_vec(data.to_vec(), None)
